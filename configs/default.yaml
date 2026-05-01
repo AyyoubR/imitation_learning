@@ -1,0 +1,104 @@
+# ---------------------------------------------------------------------------
+# Imitation learning / behavioral cloning config
+# ---------------------------------------------------------------------------
+
+experiment:
+  name: "bc_pilotnet_v1"
+  seed: 42
+  output_dir: "./runs"          # checkpoints + logs land under <output_dir>/<experiment.name>
+  device: "auto"                # "auto" | "cuda" | "cpu"
+  amp: true                     # mixed precision on CUDA
+
+data:
+  # Where the CARLA dataset is rooted. The loader walks this tree and auto-detects
+  # episodes by searching for labels/*.parquet|*.csv|*.json files.
+  root: "../../carla_data/dataset"
+  camera: "rgb_front"           # which camera column to use (matches `img_<camera>`)
+  label_formats: ["parquet", "csv", "json"]
+  # Optional filters – applied on the parquet/csv label rows:
+  filter:
+    min_speed_kmh: null         # e.g. 0.5 to drop fully-stopped frames
+    buckets: null               # e.g. ["expert", "perturbed"] to skip rare/recovery
+
+  # Split strategy: by episode means validation episodes never leak into training.
+  split:
+    strategy: "episode"         # "episode" | "random"
+    val_fraction: 0.15
+    test_fraction: 0.0
+
+  # Preprocessing / input pipeline
+  image:
+    # Source image is 400x300. Camera sits forward of the ego (x=1.5, z=1.6) so
+    # the hood isn't visible — only crop sky from the top.
+    crop_top: 40                # pixels cropped from top (sky); reduce if traffic lights matter
+    crop_bottom: 0              # no hood in this dataset
+    resize_width: 200
+    resize_height: 88
+    # Normalization mode: "minmax" -> /255 in [0,1], "imagenet" -> subtract ImageNet mean/std.
+    normalize: "imagenet"
+
+  # Train-time augmentation
+  augment:
+    enabled: true
+    brightness: 0.25            # +/- brightness factor
+    contrast: 0.20
+    hue_shift: 0.02
+    gaussian_noise_std: 0.01
+    rotation_deg: 2.0
+    horizontal_flip_prob: 0.0   # careful: flipping flips the sign of steering — off by default
+
+  # Dataset imbalance handling. Steering is heavily peaked around 0.
+  sampler:
+    enabled: true
+    num_bins: 21                # bins over steering in [-1,1]
+    smoothing: 0.05             # avoid zero-weight bins
+    max_weight: 100.0
+
+  loader:
+    batch_size: 64
+    num_workers: 4
+    pin_memory: true
+    persistent_workers: true
+    prefetch_factor: 2
+
+model:
+  arch: "pilotnet"              # "pilotnet" | "deepcnn"
+  dropout: 0.2
+  # How to squash outputs. For throttle/brake CARLA expects [0,1], steering [-1,1].
+  activation: "bounded"         # "bounded" (tanh/sigmoid) | "linear" (clamp in post)
+  #steering only regression head, or multi-task with throttle+brake heads:
+  multi_task: true
+
+training:
+  epochs: 40
+  loss:
+    kind: "smoothl1"            # "mse" | "smoothl1"
+    steer_weight: 1.0           # loss weight on the steer head
+    throttle_weight: 0.5
+    brake_weight: 0.5
+  optimizer:
+    kind: "adam"                # "adam" | "adamw"
+    lr: 1.0e-4
+    weight_decay: 1.0e-5
+    betas: [0.9, 0.999]
+  scheduler:
+    kind: "cosine"              # "cosine" | "plateau" | "none"
+    warmup_epochs: 2
+    min_lr: 1.0e-6
+  grad_clip: 1.0
+  log_interval: 50              # steps between console log lines
+  tensorboard: true
+  checkpoint:
+    every_epochs: 1
+    keep_last: 3                # rolling window of recent checkpoints
+    save_best: true             # also keep `best.pt`
+  early_stopping:
+    enabled: true
+    patience: 8
+    min_delta: 1.0e-4
+
+evaluation:
+  batch_size: 128
+  num_workers: 4
+  save_plots: true
+  num_visual_samples: 16        # render worst/best predictions to tensorboard + plots dir
