@@ -47,7 +47,6 @@ The pipeline uses PyTorch + PIL + pandas only — no `torchvision` or
 ## Train
 
 ```bash
-cd project
 python main.py train --config configs/default.yaml
 ```
 
