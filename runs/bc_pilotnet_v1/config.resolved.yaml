@@ -44,7 +44,7 @@ data:
     persistent_workers: true
     prefetch_factor: 2
 model:
-  arch: pilotnet
+  arch: deepcnn
   dropout: 0.2
   activation: bounded
   multi_task_steering_throttle_brake: false

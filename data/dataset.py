@@ -220,6 +220,51 @@ def load_episode_labels(ep: EpisodeRef, camera: str | None = None) -> pd.DataFra
         log.warning("[%s] dropped %d rows with NaN controls", ep.episode_id, before - len(out))
     return out
 
+def load_episode_labels_steering_only(ep: EpisodeRef, camera: str | None = None) -> pd.DataFrame:
+    """Load + concat all label files for an episode and normalize column names."""
+    frames = []
+    for f in ep.label_files:
+        try:
+            frames.append(_load_one_label_file(f))
+        except Exception as e:
+            log.warning("skipping unreadable label file %s: %s", f, e)
+    if not frames:
+        return pd.DataFrame()
+    df = pd.concat(frames, ignore_index=True)
+
+    cols = list(df.columns)
+    steer = _first_match(cols, _STEER_ALIASES)
+    if not all([steer]):
+        raise KeyError(
+            f"[{ep.episode_id}] missing required control columns. "
+            f"steer={steer}; available={cols}"
+        )
+
+    img_col = _resolve_image_column(cols, camera)
+
+    # Build a normalized frame with a stable set of names.
+    out = pd.DataFrame({
+        "episode_id": ep.episode_id,
+        "image_path": df[img_col].astype(str).values,
+        "steer": df[steer].astype(np.float32).values,
+    })
+
+    # Optional passthrough fields
+    if (c := _first_match(cols, _SPEED_ALIASES)) is not None:
+        out["speed_kmh"] = df[c].astype(np.float32).values
+    if (c := _first_match(cols, _REWARD_ALIASES)) is not None:
+        out["reward_total"] = df[c].astype(np.float32).values
+    if "bucket" in df.columns:
+        out["bucket"] = df["bucket"].astype(str).values
+    if "frame_idx" in df.columns:
+        out["frame_idx"] = df["frame_idx"].astype(np.int64).values
+
+    # Drop rows where controls are missing / NaN
+    before = len(out)
+    out = out.dropna(subset=["steer"]).reset_index(drop=True)
+    if len(out) != before:
+        log.warning("[%s] dropped %d rows with NaN controls", ep.episode_id, before - len(out))
+    return out
 
 # ---------------------------------------------------------------------------
 # Dataset
@@ -235,6 +280,7 @@ class CarlaBCDataset(Dataset):
         preprocess: Preprocess,
         augment: Augment | None = None,
         return_meta: bool = False,
+        multi_task: bool = False,
     ):
         if "image_path" not in samples.columns:
             raise ValueError("samples dataframe must contain an 'image_path' column")
@@ -244,6 +290,7 @@ class CarlaBCDataset(Dataset):
         self.preprocess = preprocess
         self.augment = augment
         self.return_meta = return_meta
+        self.multi_task = bool(multi_task)
 
         # Precompute absolute image paths (fast; avoids string ops in __getitem__).
         rel_paths = self.df["image_path"].values
@@ -256,8 +303,9 @@ class CarlaBCDataset(Dataset):
         self._abs_paths: list[str] = abs_paths
 
         self._steer = self.df["steer"].to_numpy(dtype=np.float32)
-        self._throttle = self.df["throttle"].to_numpy(dtype=np.float32)
-        self._brake = self.df["brake"].to_numpy(dtype=np.float32)
+        if self.multi_task:
+            self._throttle = self.df["throttle"].to_numpy(dtype=np.float32)
+            self._brake = self.df["brake"].to_numpy(dtype=np.float32)
 
     def __len__(self) -> int:
         return len(self.df)
@@ -276,14 +324,19 @@ class CarlaBCDataset(Dataset):
             return self.__getitem__((idx + 1) % len(self))
 
         steer = float(self._steer[idx])
-        throttle = float(self._throttle[idx])
-        brake = float(self._brake[idx])
 
         if self.augment is not None:
             img, steer = self.augment(img, steer)
 
         tensor = self.preprocess(img)
-        targets = torch.tensor([steer, throttle, brake], dtype=torch.float32)
+
+        if self.multi_task:
+            throttle = float(self._throttle[idx])
+            brake = float(self._brake[idx])
+            targets = torch.tensor([steer, throttle, brake], dtype=torch.float32)
+        else:
+            targets = torch.tensor([steer], dtype=torch.float32)
+
 
         out = {"image": tensor, "targets": targets}
         if self.return_meta:
@@ -350,9 +403,13 @@ def build_dataloaders(cfg) -> dict:
     ep_roots = {ep.episode_id: ep.root for ep in episodes}
 
     # Load all labels once; cheaper than reloading per split.
+    multi_task = bool(cfg.model.get("multi_task_steering_throttle_brake", False))
     per_ep_frames: dict[str, pd.DataFrame] = {}
     for ep in episodes:
-        df = load_episode_labels(ep, camera=data_cfg.get("camera"))
+        if multi_task:
+            df = load_episode_labels(ep, camera=data_cfg.get("camera"))
+        else:
+            df = load_episode_labels_steering_only(ep, camera=data_cfg.get("camera"))
         if len(df) == 0:
             log.warning("episode %s has no usable rows", ep.episode_id)
             continue
@@ -394,9 +451,9 @@ def build_dataloaders(cfg) -> dict:
     preprocess = build_preprocess(data_cfg.image)
     augment = build_augment(data_cfg.get("augment"))
 
-    train_ds = CarlaBCDataset(train_df, ep_roots, preprocess, augment=augment)
-    val_ds = CarlaBCDataset(val_df, ep_roots, preprocess, augment=None)
-    test_ds = CarlaBCDataset(test_df, ep_roots, preprocess, augment=None) if len(test_df) else None
+    train_ds = CarlaBCDataset(train_df, ep_roots, preprocess, augment=augment, multi_task=multi_task)
+    val_ds = CarlaBCDataset(val_df, ep_roots, preprocess, augment=None, multi_task=multi_task)
+    test_ds = CarlaBCDataset(test_df, ep_roots, preprocess, augment=None, multi_task=multi_task) if len(test_df) else None
 
     loader_cfg = data_cfg.loader
     sampler_cfg = data_cfg.get("sampler") or {}

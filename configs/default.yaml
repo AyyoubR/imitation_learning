@@ -62,7 +62,7 @@ data:
     prefetch_factor: 2
 
 model:
-  arch: "pilotnet"              # "pilotnet" | "deepcnn"
+  arch: "deepcnn"              # "pilotnet" | "deepcnn"
   dropout: 0.2
   # How to squash outputs. For throttle/brake CARLA expects [0,1], steering [-1,1].
   activation: "bounded"         # "bounded" (tanh/sigmoid) | "linear" (clamp in post)

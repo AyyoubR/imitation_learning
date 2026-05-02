@@ -63,6 +63,7 @@ class WeightedControlLoss_SteeringOnly(nn.Module):
         self.register_buffer("weights", torch.tensor([w_steer],
                                                      dtype=torch.float32))
 
+
     def _per_element(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         if self.kind == "mse":
             return (pred - target) ** 2
@@ -71,8 +72,8 @@ class WeightedControlLoss_SteeringOnly(nn.Module):
         raise ValueError(f"Unknown loss kind: {self.kind}")
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> tuple[torch.Tensor, dict]:
-        elems = self._per_element(pred, target)            # (B, 3)
-        per_head = elems.mean(dim=0)                       # (3,)
+        elems = self._per_element(pred, target)            # (B, 1)
+        per_head = elems.mean(dim=0)                       # (1,)
         total = (per_head * self.weights.to(pred.device)).sum()
         return total, {
             "loss_steer": per_head[0].item(),
