@@ -32,7 +32,7 @@ import torch
 # Make the project package importable when running from the project root.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from models.model import BCModel  # noqa: E402
+from models.model import BCModel, BCModel_SteeringOnly, build_model, build_model_steering_only  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -63,12 +63,20 @@ def _load_model(checkpoint_path: Path, device: torch.device):
     image_cfg = cfg["data"]["image"]
 
     input_hw = (int(image_cfg["resize_height"]), int(image_cfg["resize_width"]))
-    model = BCModel(
-        arch=state.get("arch", cfg["model"].get("arch", "pilotnet")),
-        dropout=float(cfg["model"].get("dropout", 0.0)),
-        activation=state.get("activation", cfg["model"].get("activation", "bounded")),
-        input_hw=input_hw,
-    ).to(device)
+    if cfg["model"].get("multi_task_steering_throttle_brake", False):
+        model = BCModel(
+            arch=state.get("arch", cfg["model"].get("arch", "pilotnet")),
+            dropout=float(cfg["model"].get("dropout", 0.0)),
+            activation=state.get("activation", cfg["model"].get("activation", "bounded")),
+            input_hw=input_hw,
+        ).to(device)
+    else:
+        model = BCModel_SteeringOnly(
+            arch=state.get("arch", cfg["model"].get("arch", "pilotnet")),
+            dropout=float(cfg["model"].get("dropout", 0.0)),
+            activation=state.get("activation", cfg["model"].get("activation", "bounded")),
+            input_hw=input_hw,
+        ).to(device)
     model.load_state_dict(state["model_state_dict"])
     model.eval()
     return model, input_hw

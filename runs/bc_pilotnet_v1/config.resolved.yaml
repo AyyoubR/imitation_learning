@@ -5,7 +5,7 @@ experiment:
   device: auto
   amp: true
 data:
-  root: ../../carla_data/dataset
+  root: ../carla_data/dataset
   camera: rgb_front
   label_formats:
   - parquet
@@ -47,7 +47,7 @@ model:
   arch: pilotnet
   dropout: 0.2
   activation: bounded
-  multi_task: true
+  multi_task_steering_throttle_brake: false
 training:
   epochs: 40
   loss:

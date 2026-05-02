@@ -20,7 +20,7 @@ import numpy as np
 import torch
 from PIL import Image
 
-from models.model import BCModel
+from models.model import BCModel, BCModel_SteeringOnly, build_model, build_model_steering_only
 from utils.transforms import Preprocess
 
 
@@ -43,12 +43,22 @@ class BCController:
         )
 
         input_hw = (int(image_cfg["resize_height"]), int(image_cfg["resize_width"]))
-        self.model = BCModel(
-            arch=state.get("arch", cfg["model"].get("arch", "pilotnet")),
-            dropout=float(cfg["model"].get("dropout", 0.0)),
-            activation=state.get("activation", cfg["model"].get("activation", "bounded")),
-            input_hw=input_hw,
-        ).to(self.device)
+        self.multi_task = bool(cfg["model"].get("multi_task_steering_throttle_brake", False))
+        if self.multi_task:
+            self.model = BCModel(
+                arch=state.get("arch", cfg["model"].get("arch", "pilotnet")),
+                dropout=float(cfg["model"].get("dropout", 0.0)),
+                activation=state.get("activation", cfg["model"].get("activation", "bounded")),
+                input_hw=input_hw,
+            ).to(self.device)
+        else:
+            self.model = BCModel_SteeringOnly(
+                arch=state.get("arch", cfg["model"].get("arch", "pilotnet")),
+                dropout=float(cfg["model"].get("dropout", 0.0)),
+                activation=state.get("activation", cfg["model"].get("activation", "bounded")),
+                input_hw=input_hw,
+            ).to(self.device)
+
         self.model.load_state_dict(state["model_state_dict"])
         self.model.eval()
 
@@ -73,14 +83,18 @@ class BCController:
         img = Image.fromarray(rgb_image, mode="RGB")
         tensor = self.preprocess(img).unsqueeze(0).to(self.device)
         pred = self.model.predict_controls(tensor).squeeze(0).cpu().numpy()
-
-        steer = float(np.clip(pred[0], -1.0, 1.0))
-        throttle = float(np.clip(pred[1], 0.0, 1.0))
-        brake = float(np.clip(pred[2], 0.0, 1.0))
-        if throttle >= brake:
-            brake = 0.0
+        if self.multi_task:
+            steer = float(np.clip(pred[0], -1.0, 1.0))
+            throttle = float(np.clip(pred[1], 0.0, 1.0))
+            brake = float(np.clip(pred[2], 0.0, 1.0))
+            if throttle >= brake:
+                brake = 0.0
+            else:
+                throttle = 0.0
         else:
+            steer = float(np.clip(pred[0], -1.0, 1.0))
             throttle = 0.0
+            brake = 0.0
         return steer, throttle, brake
 
     @torch.no_grad()

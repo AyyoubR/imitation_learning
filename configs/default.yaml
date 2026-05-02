@@ -67,7 +67,7 @@ model:
   # How to squash outputs. For throttle/brake CARLA expects [0,1], steering [-1,1].
   activation: "bounded"         # "bounded" (tanh/sigmoid) | "linear" (clamp in post)
   #steering only regression head, or multi-task with throttle+brake heads:
-  multi_task: true
+  multi_task_steering_throttle_brake: false
 
 training:
   epochs: 40

@@ -183,6 +183,90 @@ class BCModel(nn.Module):
         return out
 
 
+class BCModel_SteeringOnly(nn.Module):
+    """Image encoder + regression head for steering only."""
+
+    def __init__(
+        self,
+        arch: Literal["pilotnet", "deepcnn"] = "pilotnet",
+        dropout: float = 0.2,
+        activation: Literal["bounded", "linear"] = "bounded",
+        input_hw: tuple[int, int] = (88, 200),
+    ):
+        super().__init__()
+        self.arch = arch
+        self.activation = activation
+        self.input_hw = input_hw
+
+        if arch == "pilotnet":
+            self.backbone = _PilotNet()
+        elif arch == "deepcnn":
+            self.backbone = _DeepCNN()
+        else:
+            raise ValueError(f"Unknown arch: {arch}")
+
+        # Figure out the flattened feature size with a dry forward pass.
+        with torch.no_grad():
+            dummy = torch.zeros(1, 3, input_hw[0], input_hw[1])
+            feat = self.backbone(dummy)
+            feat_channels = feat.shape[1]
+            feat_flat = feat.flatten(1).shape[1]
+
+        if arch == "pilotnet":
+            self.head = nn.Sequential(
+                nn.Flatten(),
+                nn.Dropout(dropout),
+                nn.Linear(feat_flat, 100), nn.ELU(),
+                nn.Dropout(dropout),
+                nn.Linear(100, 50), nn.ELU(),
+                nn.Linear(50, 10), nn.ELU(),
+                nn.Linear(10, 1),
+            )
+        else:
+            self.head = nn.Sequential(
+                nn.AdaptiveAvgPool2d(1),
+                nn.Flatten(),
+                nn.Dropout(dropout),
+                nn.Linear(feat_channels, 128),
+                nn.ReLU(inplace=True),
+                nn.Dropout(dropout),
+                nn.Linear(128, 1),
+            )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
+                nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        feat = self.backbone(x)
+        raw = self.head(feat)
+        if self.activation == "bounded":
+            return bounded_controls(raw)
+        # "linear" — return raw values; caller is expected to clamp for inference
+        return raw
+
+    @torch.no_grad()
+    def predict_controls(self, x: torch.Tensor) -> torch.Tensor:
+        """Run the model and always clamp to physical control ranges."""
+        out = self.forward(x)
+        if self.activation != "bounded":
+            out = torch.stack([
+                out[..., 0].clamp(-1.0, 1.0)
+            ], dim=-1)
+        return out
+
+
 # ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
@@ -192,6 +276,17 @@ def build_model(cfg) -> BCModel:
     input_hw = (int(image_cfg.resize_height), int(image_cfg.resize_width))
     model_cfg = cfg.model
     return BCModel(
+        arch=str(model_cfg.get("arch", "pilotnet")),
+        dropout=float(model_cfg.get("dropout", 0.2)),
+        activation=str(model_cfg.get("activation", "bounded")),
+        input_hw=input_hw,
+    )
+
+def build_model_steering_only(cfg) -> BCModel_SteeringOnly:
+    image_cfg = cfg.data.image
+    input_hw = (int(image_cfg.resize_height), int(image_cfg.resize_width))
+    model_cfg = cfg.model
+    return BCModel_SteeringOnly(
         arch=str(model_cfg.get("arch", "pilotnet")),
         dropout=float(model_cfg.get("dropout", 0.2)),
         activation=str(model_cfg.get("activation", "bounded")),

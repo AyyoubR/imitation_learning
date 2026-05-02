@@ -17,7 +17,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau
 from torch.utils.data import DataLoader
 
 from data.dataset import build_dataloaders
-from models.model import BCModel, build_model
+from models.model import BCModel, build_model, BCModel_SteeringOnly, build_model_steering_only
 from utils.config import save_config
 from utils.logging import MetricTracker, get_logger
 
@@ -151,14 +151,17 @@ class Trainer:
         self.test_loader: DataLoader | None = data["test_loader"]
 
         # Model
-        self.model: BCModel = build_model(cfg).to(self.device)
+        if cfg.model.multi_task_steering_throttle_brake:
+            self.model: BCModel = build_model(cfg).to(self.device)
+        else:
+            self.model: BCModel_SteeringOnly = build_model_steering_only(cfg).to(self.device)
         n_params = sum(p.numel() for p in self.model.parameters())
         self.logger.info("model=%s params=%.2fM activation=%s",
                          self.model.arch, n_params / 1e6, self.model.activation)
 
         # Loss / optim / scheduler
         loss_cfg = cfg.training.loss
-        if cfg.model.get("multi_task", True):
+        if cfg.model.get("multi_task_steering_throttle_brake", True):
             self.criterion = WeightedControlLoss(
                 kind=str(loss_cfg.get("kind", "smoothl1")),
                 w_steer=float(loss_cfg.get("steer_weight", 1.0)),
@@ -299,23 +302,40 @@ class Trainer:
                 steer_std = preds[:, 0].detach().float().std().item() if preds.shape[0] > 1 else 0.0
 
             n = images.size(0)
-            tracker.update({
-                "loss": loss.item(),
-                **head_losses,
-                "mae_steer": mae[0].item(),
-                "mae_throttle": mae[1].item(),
-                "mae_brake": mae[2].item(),
-                "pred_steer_std": steer_std,
-            }, n=n)
+            if self.cfg.model.get("multi_task_steering_throttle_brake", True):
+                tracker.update({
+                    "loss": loss.item(),
+                    **head_losses,
+                    "mae_steer": mae[0].item(),
+                    "mae_throttle": mae[1].item(),
+                    "mae_brake": mae[2].item(),
+                    "pred_steer_std": steer_std,
+                }, n=n)
+                if train and step % int(self.cfg.training.get("log_interval", 50)) == 0:
+                    lr = self.optimizer.param_groups[0]["lr"]
+                    self.logger.info(
+                        "ep=%d %s step=%d/%d lr=%.2e loss=%.4f mae_s=%.4f mae_t=%.4f mae_b=%.4f",
+                        epoch, prefix, step, steps, lr,
+                        tracker.avg("loss"), tracker.avg("mae_steer"),
+                        tracker.avg("mae_throttle"), tracker.avg("mae_brake"),
+                    )                
+            
+            else:
+                tracker.update({
+                    "loss": loss.item(),
+                    **head_losses,
+                    "mae_steer": mae[0].item(),
+                    "pred_steer_std": steer_std,
+                }, n=n)
+                if train and step % int(self.cfg.training.get("log_interval", 50)) == 0:
+                    lr = self.optimizer.param_groups[0]["lr"]
+                    self.logger.info(
+                        "ep=%d %s step=%d/%d lr=%.2e loss=%.4f mae_s=%.4f",
+                        epoch, prefix, step, steps, lr,
+                        tracker.avg("loss"), tracker.avg("mae_steer"),
+                    )
 
-            if train and step % int(self.cfg.training.get("log_interval", 50)) == 0:
-                lr = self.optimizer.param_groups[0]["lr"]
-                self.logger.info(
-                    "ep=%d %s step=%d/%d lr=%.2e loss=%.4f mae_s=%.4f mae_t=%.4f mae_b=%.4f",
-                    epoch, prefix, step, steps, lr,
-                    tracker.avg("loss"), tracker.avg("mae_steer"),
-                    tracker.avg("mae_throttle"), tracker.avg("mae_brake"),
-                )
+
 
         metrics = tracker.as_dict()
         metrics["epoch_time_s"] = time.time() - t0
@@ -340,11 +360,19 @@ class Trainer:
                     self.scheduler.step()
 
             lr = self.optimizer.param_groups[0]["lr"]
-            self.logger.info(
-                "[epoch %d] train_loss=%.4f val_loss=%.4f val_mae_s=%.4f val_mae_t=%.4f val_mae_b=%.4f lr=%.2e",
-                epoch, train_metrics["loss"], val_metrics["loss"],
-                val_metrics["mae_steer"], val_metrics["mae_throttle"], val_metrics["mae_brake"], lr,
-            )
+            if self.cfg.model.get("multi_task_steering_throttle_brake", True):
+                self.logger.info(
+                    "[epoch %d] train_loss=%.4f val_loss=%.4f val_mae_s=%.4f val_mae_t=%.4f val_mae_b=%.4f lr=%.2e",
+                    epoch, train_metrics["loss"], val_metrics["loss"],
+                    val_metrics["mae_steer"], val_metrics["mae_throttle"], val_metrics["mae_brake"], lr,
+                )
+            else:   
+                
+                self.logger.info(
+                    "[epoch %d] train_loss=%.4f val_loss=%.4f val_mae_s=%.4f lr=%.2e",
+                    epoch, train_metrics["loss"], val_metrics["loss"],
+                    val_metrics["mae_steer"], lr,
+                )
 
             if self.writer is not None:
                 for k, v in train_metrics.items():
