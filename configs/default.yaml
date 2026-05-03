@@ -12,7 +12,7 @@ experiment:
 data:
   # Where the CARLA dataset is rooted. The loader walks this tree and auto-detects
   # episodes by searching for labels/*.parquet|*.csv|*.json files.
-  root: "../carla_data/dataset"
+  root: "../carla_data/dataset/highway_lane_following/worker_0"  # adjust to your dataset path
   camera: "rgb_front"           # which camera column to use (matches `img_<camera>`)
   label_formats: ["parquet", "csv", "json"]
   # Optional filters – applied on the parquet/csv label rows:

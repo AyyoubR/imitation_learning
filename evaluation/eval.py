@@ -10,7 +10,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from data.dataset import build_dataloaders
-from models.model import BCModel, build_model
+from models.model import BCModel, build_model, BCModel_SteeringOnly, build_model_steering_only
 from utils.logging import get_logger
 
 
@@ -40,7 +40,11 @@ class Evaluator:
             raise ValueError(f"Unknown split: {split}")
 
         # Model
-        self.model: BCModel = build_model(cfg).to(self.device)
+        if cfg.model.multi_task_steering_throttle_brake:
+            self.model: BCModel = build_model(cfg).to(self.device)
+        else: 
+            self.model: BCModel_SteeringOnly = build_model_steering_only(cfg).to(self.device)
+
         state = torch.load(self.checkpoint_path, map_location=self.device, weights_only=False)
         self.model.load_state_dict(state["model_state_dict"])
         self.model.eval()

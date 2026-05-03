@@ -5,7 +5,7 @@ experiment:
   device: auto
   amp: true
 data:
-  root: ../carla_data/dataset
+  root: ../carla_data/dataset/highway_lane_following/worker_0
   camera: rgb_front
   label_formats:
   - parquet

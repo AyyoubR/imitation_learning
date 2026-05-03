@@ -63,7 +63,7 @@ def _load_model(checkpoint_path: Path, device: torch.device):
     image_cfg = cfg["data"]["image"]
 
     input_hw = (int(image_cfg["resize_height"]), int(image_cfg["resize_width"]))
-    if cfg["model"].get("multi_task_steering_throttle_brake", False):
+    if cfg.model.multi_task_steering_throttle_brake:
         model = BCModel(
             arch=state.get("arch", cfg["model"].get("arch", "pilotnet")),
             dropout=float(cfg["model"].get("dropout", 0.0)),
@@ -77,6 +77,7 @@ def _load_model(checkpoint_path: Path, device: torch.device):
             activation=state.get("activation", cfg["model"].get("activation", "bounded")),
             input_hw=input_hw,
         ).to(device)
+
     model.load_state_dict(state["model_state_dict"])
     model.eval()
     return model, input_hw
