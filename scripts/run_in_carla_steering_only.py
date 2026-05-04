@@ -150,7 +150,8 @@ def main():
     random.seed(args.seed)
 
     ctrl = BCController(args.checkpoint, device=args.device)
-    print(f"Loaded BC controller from {args.checkpoint}")
+    ctrl.reset()  # clear temporal frame buffer (no-op for non-LSTM archs)
+    print(f"Loaded BC controller from {args.checkpoint} (arch={ctrl.arch})")
 
     client = carla.Client(args.host, args.port)
     client.set_timeout(20.0)

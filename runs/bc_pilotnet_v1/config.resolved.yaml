@@ -5,7 +5,7 @@ experiment:
   device: auto
   amp: true
 data:
-  root: ../carla_data/dataset/highway_lane_following/worker_0
+  root: /home/T6795AR/Documents/Training/repo/carla_data/dataset/highway_lane_following/worker_00
   camera: rgb_front
   label_formats:
   - parquet
@@ -44,10 +44,13 @@ data:
     persistent_workers: true
     prefetch_factor: 2
 model:
-  arch: deepcnn
+  arch: deepcnn_lstm
   dropout: 0.2
   activation: bounded
   multi_task_steering_throttle_brake: false
+  seq_len: 4
+  lstm_hidden: 256
+  lstm_layers: 1
 training:
   epochs: 40
   loss:

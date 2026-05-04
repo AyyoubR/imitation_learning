@@ -345,6 +345,121 @@ class CarlaBCDataset(Dataset):
         return out
 
 
+class CarlaBCSequenceDataset(Dataset):
+    """Sequence-aware variant: yields a stack of T frames ending at `idx`.
+
+    For index ``i`` we return frames ``[i - (T-1), ..., i - 1, i]`` all drawn
+    from the SAME episode as ``i``. Near an episode boundary we pad by
+    repeating the first frame of the episode — this mirrors what the CARLA
+    runtime does before its frame buffer fills, so training and inference
+    stay consistent.
+
+    The returned ``image`` tensor has shape ``(T, C, H, W)``. The steering
+    label corresponds to the *current* frame (the last one in the sequence),
+    which is also what drives the balanced sampler via ``steer_values``.
+    """
+
+    def __init__(
+        self,
+        samples: pd.DataFrame,
+        episode_roots: dict[str, Path],
+        preprocess: Preprocess,
+        augment: Augment | None = None,
+        return_meta: bool = False,
+        multi_task: bool = False,
+        seq_len: int = 4,
+    ):
+        if "image_path" not in samples.columns:
+            raise ValueError("samples dataframe must contain an 'image_path' column")
+        if int(seq_len) < 1:
+            raise ValueError(f"seq_len must be >= 1, got {seq_len}")
+
+        # Temporal order within each episode is required for the sequence to
+        # be meaningful. Sort by frame_idx if available, else by image_path
+        # (CARLA filenames are zero-padded, so lex order == temporal order).
+        df = samples.copy()
+        sort_keys = ["episode_id", "frame_idx"] if "frame_idx" in df.columns else ["episode_id", "image_path"]
+        df = df.sort_values(sort_keys, kind="stable").reset_index(drop=True)
+
+        self.df = df
+        self.seq_len = int(seq_len)
+        self.episode_roots = {str(k): Path(v) for k, v in episode_roots.items()}
+        self.preprocess = preprocess
+        self.augment = augment
+        self.return_meta = return_meta
+        self.multi_task = bool(multi_task)
+
+        rel_paths = self.df["image_path"].values
+        ep_ids = self.df["episode_id"].values
+        abs_paths: list[str] = []
+        for ep_id, rel in zip(ep_ids, rel_paths):
+            root = self.episode_roots[str(ep_id)]
+            p = Path(rel)
+            abs_paths.append(str(p if p.is_absolute() else root / p))
+        self._abs_paths = abs_paths
+
+        # For each row, precompute the first index in its episode so __getitem__
+        # can clamp `idx - k` without walking the DataFrame.
+        starts = np.empty(len(df), dtype=np.int64)
+        current_ep: str | None = None
+        current_start = 0
+        for i, ep in enumerate(ep_ids):
+            if ep != current_ep:
+                current_ep = ep
+                current_start = i
+            starts[i] = current_start
+        self._ep_start = starts
+
+        self._steer = self.df["steer"].to_numpy(dtype=np.float32)
+        if self.multi_task:
+            self._throttle = self.df["throttle"].to_numpy(dtype=np.float32)
+            self._brake = self.df["brake"].to_numpy(dtype=np.float32)
+
+    def __len__(self) -> int:
+        return len(self.df)
+
+    @property
+    def steer_values(self) -> np.ndarray:
+        return self._steer
+
+    def _load_image(self, idx: int) -> Image.Image:
+        path = self._abs_paths[idx]
+        try:
+            return Image.open(path).convert("RGB")
+        except Exception as e:
+            log.warning("failed to open %s (%s) — using neighbor", path, e)
+            return self._load_image((idx + 1) % len(self._abs_paths))
+
+    def __getitem__(self, idx: int) -> dict[str, Any]:
+        T = self.seq_len
+        start = int(self._ep_start[idx])
+        # Oldest→newest. Indices before the episode start are clamped to `start`
+        # (i.e. the first frame of the episode is repeated as padding).
+        seq_idx = [max(start, idx - (T - 1 - k)) for k in range(T)]
+
+        imgs = [self._load_image(i) for i in seq_idx]
+        steer = float(self._steer[idx])
+
+        if self.augment is not None:
+            imgs, steer = self.augment.apply_sequence(imgs, steer)
+
+        tensors = [self.preprocess(im) for im in imgs]
+        stacked = torch.stack(tensors, dim=0)  # (T, C, H, W)
+
+        if self.multi_task:
+            throttle = float(self._throttle[idx])
+            brake = float(self._brake[idx])
+            targets = torch.tensor([steer, throttle, brake], dtype=torch.float32)
+        else:
+            targets = torch.tensor([steer], dtype=torch.float32)
+
+        out = {"image": stacked, "targets": targets}
+        if self.return_meta:
+            out["image_path"] = self._abs_paths[idx]
+            out["episode_id"] = str(self.df["episode_id"].iloc[idx])
+        return out
+
+
 # ---------------------------------------------------------------------------
 # Train/val split + dataloaders
 # ---------------------------------------------------------------------------
@@ -451,9 +566,28 @@ def build_dataloaders(cfg) -> dict:
     preprocess = build_preprocess(data_cfg.image)
     augment = build_augment(data_cfg.get("augment"))
 
-    train_ds = CarlaBCDataset(train_df, ep_roots, preprocess, augment=augment, multi_task=multi_task)
-    val_ds = CarlaBCDataset(val_df, ep_roots, preprocess, augment=None, multi_task=multi_task)
-    test_ds = CarlaBCDataset(test_df, ep_roots, preprocess, augment=None, multi_task=multi_task) if len(test_df) else None
+    # Pick the sequence-aware dataset for temporal (LSTM) models. Any new
+    # temporal arch should be added here.
+    arch = str(cfg.model.get("arch", "pilotnet"))
+    sequence_models = {"deepcnn_lstm"}
+    if arch in sequence_models:
+        seq_len = int(cfg.model.get("seq_len", 4))
+        log.info("using CarlaBCSequenceDataset (arch=%s, seq_len=%d)", arch, seq_len)
+        def _make_ds(df, aug):
+            return CarlaBCSequenceDataset(
+                df, ep_roots, preprocess,
+                augment=aug, multi_task=multi_task, seq_len=seq_len,
+            )
+    else:
+        def _make_ds(df, aug):
+            return CarlaBCDataset(
+                df, ep_roots, preprocess,
+                augment=aug, multi_task=multi_task,
+            )
+
+    train_ds = _make_ds(train_df, augment)
+    val_ds = _make_ds(val_df, None)
+    test_ds = _make_ds(test_df, None) if len(test_df) else None
 
     loader_cfg = data_cfg.loader
     sampler_cfg = data_cfg.get("sampler") or {}

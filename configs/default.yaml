@@ -12,7 +12,7 @@ experiment:
 data:
   # Where the CARLA dataset is rooted. The loader walks this tree and auto-detects
   # episodes by searching for labels/*.parquet|*.csv|*.json files.
-  root: "../carla_data/dataset/highway_lane_following/worker_0"  # adjust to your dataset path
+  root: "/home/T6795AR/Documents/Training/carla_data/dataset/run_0001/worker_00"  # adjust to your dataset path
   camera: "rgb_front"           # which camera column to use (matches `img_<camera>`)
   label_formats: ["parquet", "csv", "json"]
   # Optional filters – applied on the parquet/csv label rows:
@@ -62,12 +62,16 @@ data:
     prefetch_factor: 2
 
 model:
-  arch: "deepcnn"              # "pilotnet" | "deepcnn"
+  arch: "deepcnn_lstm"          # "pilotnet" | "deepcnn" | "deepcnn_lstm"
   dropout: 0.2
   # How to squash outputs. For throttle/brake CARLA expects [0,1], steering [-1,1].
   activation: "bounded"         # "bounded" (tanh/sigmoid) | "linear" (clamp in post)
   #steering only regression head, or multi-task with throttle+brake heads:
   multi_task_steering_throttle_brake: false
+  # Temporal context for "deepcnn_lstm" — ignored by the non-sequence archs.
+  seq_len: 4                    # current frame + (seq_len-1) previous frames
+  lstm_hidden: 256
+  lstm_layers: 1
 
 training:
   epochs: 40

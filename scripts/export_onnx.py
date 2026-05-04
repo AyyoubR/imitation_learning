@@ -32,7 +32,13 @@ import torch
 # Make the project package importable when running from the project root.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from models.model import BCModel, BCModel_SteeringOnly, build_model, build_model_steering_only  # noqa: E402
+from models.model import (  # noqa: E402
+    BCModel,
+    BCModel_SteeringOnly,
+    _DeepCNN_LSTM_steering_only,
+    build_model,
+    build_model_steering_only,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -55,7 +61,11 @@ def parse_args() -> argparse.Namespace:
 
 
 def _load_model(checkpoint_path: Path, device: torch.device):
-    """Rebuild BCModel from the checkpoint — mirrors BCController.__init__."""
+    """Rebuild the model from a checkpoint — mirrors BCController.__init__.
+
+    Returns ``(model, input_hw, seq_len)``. ``seq_len`` is ``1`` for the
+    non-temporal archs and the configured value for ``deepcnn_lstm``.
+    """
     state = torch.load(
         str(checkpoint_path), map_location=device, weights_only=False,
     )
@@ -63,24 +73,35 @@ def _load_model(checkpoint_path: Path, device: torch.device):
     image_cfg = cfg["data"]["image"]
 
     input_hw = (int(image_cfg["resize_height"]), int(image_cfg["resize_width"]))
-    if cfg.model.multi_task_steering_throttle_brake:
-        model = BCModel(
-            arch=state.get("arch", cfg["model"].get("arch", "pilotnet")),
-            dropout=float(cfg["model"].get("dropout", 0.0)),
-            activation=state.get("activation", cfg["model"].get("activation", "bounded")),
+    arch = str(state.get("arch", cfg["model"].get("arch", "pilotnet")))
+    activation = str(state.get("activation", cfg["model"].get("activation", "bounded")))
+    dropout = float(cfg["model"].get("dropout", 0.0))
+    multi_task = bool(cfg["model"].get("multi_task_steering_throttle_brake", False))
+
+    if arch == "deepcnn_lstm":
+        seq_len = int(cfg["model"].get("seq_len", 4))
+        model = _DeepCNN_LSTM_steering_only(
+            seq_len=seq_len,
+            lstm_hidden=int(cfg["model"].get("lstm_hidden", 256)),
+            lstm_layers=int(cfg["model"].get("lstm_layers", 1)),
+            dropout=dropout,
+            activation=activation,
             input_hw=input_hw,
         ).to(device)
+    elif multi_task:
+        seq_len = 1
+        model = BCModel(
+            arch=arch, dropout=dropout, activation=activation, input_hw=input_hw,
+        ).to(device)
     else:
+        seq_len = 1
         model = BCModel_SteeringOnly(
-            arch=state.get("arch", cfg["model"].get("arch", "pilotnet")),
-            dropout=float(cfg["model"].get("dropout", 0.0)),
-            activation=state.get("activation", cfg["model"].get("activation", "bounded")),
-            input_hw=input_hw,
+            arch=arch, dropout=dropout, activation=activation, input_hw=input_hw,
         ).to(device)
 
     model.load_state_dict(state["model_state_dict"])
     model.eval()
-    return model, input_hw
+    return model, input_hw, seq_len
 
 
 def _default_output_path(checkpoint: Path) -> Path:
@@ -91,6 +112,7 @@ def _default_output_path(checkpoint: Path) -> Path:
 def _verify_roundtrip(model: torch.nn.Module,
                       onnx_path: Path,
                       input_hw: tuple[int, int],
+                      seq_len: int,
                       atol: float) -> None:
     """Run the ONNX through onnxruntime and compare against PyTorch."""
     try:
@@ -103,7 +125,10 @@ def _verify_roundtrip(model: torch.nn.Module,
     h, w = input_hw
     # Use a deterministic input so any mismatch is reproducible.
     rng = np.random.default_rng(0)
-    dummy_np = rng.standard_normal((2, 3, h, w), dtype=np.float32)
+    if seq_len > 1:
+        dummy_np = rng.standard_normal((2, seq_len, 3, h, w), dtype=np.float32)
+    else:
+        dummy_np = rng.standard_normal((2, 3, h, w), dtype=np.float32)
     dummy_pt = torch.from_numpy(dummy_np)
 
     with torch.no_grad():
@@ -134,14 +159,21 @@ def main() -> int:
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     device = torch.device(args.device)
-    model, (h, w) = _load_model(checkpoint, device)
+    model, (h, w), seq_len = _load_model(checkpoint, device)
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"Loaded {checkpoint.name}  arch={model.arch}  input={h}x{w}  "
+    shape_str = f"{seq_len}x3x{h}x{w}" if seq_len > 1 else f"3x{h}x{w}"
+    print(f"Loaded {checkpoint.name}  arch={model.arch}  input={shape_str}  "
           f"params={n_params:,}")
 
     # Dummy input matches the training resize dims. Dynamic batch axis so
     # the exported graph accepts any batch size at inference / visualization.
-    dummy = torch.zeros(1, 3, h, w, device=device)
+    # For temporal models (seq_len > 1) the input is (B, T, C, H, W); T is
+    # baked in at export time to match what the model's shape checks expect.
+    if seq_len > 1:
+        dummy = torch.zeros(1, seq_len, 3, h, w, device=device)
+    else:
+        dummy = torch.zeros(1, 3, h, w, device=device)
+
     torch.onnx.export(
         model,
         dummy,
@@ -158,7 +190,7 @@ def main() -> int:
     print(f"ONNX written to {out_path}  ({out_path.stat().st_size/1e6:.2f} MB)")
 
     if args.verify:
-        _verify_roundtrip(model, out_path, (h, w), args.atol)
+        _verify_roundtrip(model, out_path, (h, w), seq_len, args.atol)
 
     print()
     print("Next steps:")

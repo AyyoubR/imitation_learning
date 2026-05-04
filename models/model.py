@@ -92,7 +92,106 @@ class _DeepCNN(nn.Module):
         x = self.layer3(x)
         return x
 
+class _DeepCNN_LSTM_steering_only(nn.Module):
+    """DeepCNN encoder + LSTM temporal head for steering-only regression.
 
+    Input shape : ``(B, T, C, H, W)`` — a short window of frames ordered
+                  oldest→newest. Default ``T=4`` (current + 3 past frames).
+    Output shape: ``(B, 1)`` steering. When ``activation="bounded"`` the
+                  output is squashed to ``[-1, 1]`` with tanh.
+
+    The DeepCNN encoder is shared across timesteps (time is folded into the
+    batch dimension for a single conv pass), followed by global average
+    pooling to a per-frame 256-d vector. The sequence of per-frame vectors
+    is fed to an LSTM and the final hidden state is mapped to a single
+    steering value through a small MLP head.
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 3,
+        seq_len: int = 4,
+        feat_dim: int = 256,
+        lstm_hidden: int = 256,
+        lstm_layers: int = 1,
+        dropout: float = 0.2,
+        activation: Literal["bounded", "linear"] = "bounded",
+        input_hw: tuple[int, int] = (88, 200),
+    ):
+        super().__init__()
+        # Attributes the training/checkpointing code reads off the model.
+        self.arch = "deepcnn_lstm"
+        self.activation = activation
+        self.input_hw = input_hw
+        self.seq_len = seq_len
+        self.feat_dim = feat_dim
+
+        # Per-frame CNN encoder — weights are shared across timesteps by
+        # running the encoder once on (B*T, C, H, W).
+        self.encoder = _DeepCNN(in_channels=in_channels)
+        self.pool = nn.AdaptiveAvgPool2d(1)
+
+        self.lstm = nn.LSTM(
+            input_size=feat_dim,
+            hidden_size=lstm_hidden,
+            num_layers=lstm_layers,
+            batch_first=True,
+            dropout=dropout if lstm_layers > 1 else 0.0,
+        )
+
+        self.head = nn.Sequential(
+            nn.Dropout(dropout),
+            nn.Linear(lstm_hidden, 64),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(64, 1),
+        )
+
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
+                nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() != 5:
+            raise ValueError(
+                f"Expected input of shape (B, T, C, H, W); got {tuple(x.shape)}"
+            )
+        b, t, c, h, w = x.shape
+        if t != self.seq_len:
+            raise ValueError(
+                f"Expected T={self.seq_len} frames (current + {self.seq_len - 1} past); got T={t}"
+            )
+
+        feats = self.encoder(x.reshape(b * t, c, h, w))   # (B*T, 256, h', w')
+        feats = self.pool(feats).flatten(1)               # (B*T, 256)
+        feats = feats.view(b, t, self.feat_dim)           # (B, T, 256)
+
+        lstm_out, _ = self.lstm(feats)                    # (B, T, hidden)
+        last = lstm_out[:, -1, :]                         # (B, hidden)
+
+        raw = self.head(last)                             # (B, 1)
+        if self.activation == "bounded":
+            return torch.tanh(raw)
+        return raw
+
+    @torch.no_grad()
+    def predict_controls(self, x: torch.Tensor) -> torch.Tensor:
+        out = self.forward(x)
+        if self.activation != "bounded":
+            out = out.clamp(-1.0, 1.0)
+        return out
+    
 # ---------------------------------------------------------------------------
 # Main wrapper
 # ---------------------------------------------------------------------------
@@ -282,12 +381,22 @@ def build_model(cfg) -> BCModel:
         input_hw=input_hw,
     )
 
-def build_model_steering_only(cfg) -> BCModel_SteeringOnly:
+def build_model_steering_only(cfg):
     image_cfg = cfg.data.image
     input_hw = (int(image_cfg.resize_height), int(image_cfg.resize_width))
     model_cfg = cfg.model
+    arch = str(model_cfg.get("arch", "pilotnet"))
+    if arch == "deepcnn_lstm":
+        return _DeepCNN_LSTM_steering_only(
+            seq_len=int(model_cfg.get("seq_len", 4)),
+            lstm_hidden=int(model_cfg.get("lstm_hidden", 256)),
+            lstm_layers=int(model_cfg.get("lstm_layers", 1)),
+            dropout=float(model_cfg.get("dropout", 0.2)),
+            activation=str(model_cfg.get("activation", "bounded")),
+            input_hw=input_hw,
+        )
     return BCModel_SteeringOnly(
-        arch=str(model_cfg.get("arch", "pilotnet")),
+        arch=arch,
         dropout=float(model_cfg.get("dropout", 0.2)),
         activation=str(model_cfg.get("activation", "bounded")),
         input_hw=input_hw,
